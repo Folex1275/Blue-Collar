@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import WorkersViewToggle from "@/components/WorkersViewToggle";
+import WorkerInfiniteList from "@/components/WorkerInfiniteList";
 import SearchAutocomplete from "@/components/SearchAutocomplete";
 import type { Worker, Category, ApiResponse } from "@/types";
 
