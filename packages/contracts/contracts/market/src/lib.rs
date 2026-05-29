@@ -171,6 +171,8 @@ pub enum DataKey {
     Arbitration(Symbol),
     /// Persistent storage — list of approved arbitrator addresses.
     Arbitrators,
+    /// Persistent storage — current storage schema version (u32), used by [`migrate`].
+    SchemaVersion,
 }
 
 // =============================================================================
@@ -206,6 +208,8 @@ impl MarketContract {
         assert!(fee_bps <= MAX_FEE_BPS, "fee_bps exceeds maximum (500)");
         // Store admin in persistent storage
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        // Set initial schema version
+        env.storage().persistent().set(&DataKey::SchemaVersion, &1u32);
         // Store config in instance storage
         let config = Config { fee_bps, fee_recipient };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -241,6 +245,27 @@ impl MarketContract {
             .expect("Not initialized");
         config.fee_bps = new_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
+    }
+
+    /// Update the treasury (fee recipient) address. Caller must hold [`ROLE_ADMIN`].
+    ///
+    /// # Parameters
+    /// - `caller`: Must hold `ROLE_ADMIN`; `require_auth()` is enforced.
+    /// - `new_treasury`: New address that will receive collected protocol fees.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `caller` does not hold `ROLE_ADMIN`.
+    /// - `"Not initialized"` if [`initialize`] has not been called.
+    pub fn set_treasury(env: Env, caller: Address, new_treasury: Address) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_ADMIN), &caller);
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+        config.fee_recipient = new_treasury.clone();
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish((symbol_short!("TrsSet"), caller), new_treasury);
     }
 
     // -------------------------------------------------------------------------
@@ -488,12 +513,19 @@ fn get_role_members(env: &Env, role: &Symbol) -> Vec<Address> {
 
         let client = token::Client::new(&env, &token_addr);
 
-        let fee: i128 = (amount * config.fee_bps as i128) / 10_000;
-        let worker_amount = amount - fee;
+        let fee: i128 = amount
+            .checked_mul(config.fee_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .expect("Fee overflow");
+        let worker_amount = amount.checked_sub(fee).expect("Fee underflow");
 
         client.transfer(&from, &to, &worker_amount);
         if fee > 0 {
             client.transfer(&from, &config.fee_recipient, &fee);
+            env.events().publish(
+                (symbol_short!("FeeTaken"),),
+                (fee, config.fee_recipient),
+            );
         }
 
         env.events().publish(
@@ -1028,6 +1060,67 @@ fn get_role_members(env: &Env, role: &Symbol) -> Vec<Address> {
     /// # Parameters
     /// - `new_wasm_hash`: The hash returned by `stellar contract install` for the new WASM.
     ///
+    // -------------------------------------------------------------------------
+    // Schema migration (#535)
+    // -------------------------------------------------------------------------
+
+    /// Return the current storage schema version.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32)
+    }
+
+    /// Run version-specific storage migration logic.
+    ///
+    /// Guards:
+    /// - Caller must hold `ROLE_ADMIN`.
+    /// - `expected_version` must equal the current schema version (prevents double-run
+    ///   and out-of-order migrations).
+    /// - After success the version is bumped to `expected_version + 1`.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `admin` does not hold `ROLE_ADMIN`.
+    /// - `"Wrong schema version"` if current version ≠ `expected_version`.
+    ///
+    /// # Events
+    /// Emits `("Migrated",)` with data `(expected_version, expected_version + 1)`.
+    pub fn migrate(env: Env, admin: Address, expected_version: u32) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_ADMIN), &admin);
+
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32);
+
+        assert!(current == expected_version, "Wrong schema version");
+
+        // ---- version-specific migration logic --------------------------------
+        if expected_version == 1 {
+            // Example: no structural change needed for v1→v2 in this release.
+        }
+        // ----------------------------------------------------------------------
+
+        let new_version = expected_version.checked_add(1).expect("Version overflow");
+        env.storage().persistent().set(&DataKey::SchemaVersion, &new_version);
+
+        env.events().publish(
+            (symbol_short!("Migrated"),),
+            (expected_version, new_version),
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Upgrade
+    // -------------------------------------------------------------------------
+
+    /// Upgrade the contract WASM in-place, preserving the contract ID and all storage.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: The hash returned by `stellar contract install` for the new WASM.
+    ///
     /// # Panics
     /// - `"Not initialized"` if [`initialize`] has not been called.
     /// - `"Unauthorized"` if caller does not match the stored admin.
@@ -1120,6 +1213,103 @@ mod tests {
         t.client().tip(&t.payer, &t.worker, &t.token_addr, &500_000);
         assert_eq!(t.token_balance(&t.worker), 500_000);
         assert_eq!(t.token_balance(&t.payer), 500_000);
+    }
+
+    // -------------------------------------------------------------------------
+    // Fee mechanism tests (#532)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_tip_with_fee_deducts_correctly() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let worker = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_addr = token_id.address();
+        StellarAssetClient::new(&env, &token_addr).mint(&payer, &1_000_000);
+
+        let contract_id = env.register_contract(None, MarketContract);
+        // Initialize with 100 bps (1%) fee, treasury as recipient
+        MarketContractClient::new(&env, &contract_id).initialize(&admin, &100, &treasury);
+
+        let client = MarketContractClient::new(&env, &contract_id);
+        client.tip(&payer, &worker, &token_addr, &100_000);
+
+        // fee = 100_000 * 100 / 10_000 = 1_000
+        let token = TokenClient::new(&env, &token_addr);
+        assert_eq!(token.balance(&worker), 99_000);
+        assert_eq!(token.balance(&treasury), 1_000);
+        assert_eq!(token.balance(&payer), 900_000);
+    }
+
+    #[test]
+    fn test_tip_zero_fee_sends_full_amount() {
+        let t = TestEnv::new(); // initialized with fee_bps = 0
+        let treasury_before = t.token_balance(&t.admin); // admin is fee_recipient in TestEnv
+        t.client().tip(&t.payer, &t.worker, &t.token_addr, &200_000);
+        // No fee deducted — worker gets full amount
+        assert_eq!(t.token_balance(&t.worker), 200_000);
+        assert_eq!(t.token_balance(&t.payer), 800_000);
+        // Treasury balance unchanged
+        assert_eq!(t.token_balance(&t.admin), treasury_before);
+    }
+
+    #[test]
+    fn test_set_treasury_updates_fee_recipient() {
+        let t = TestEnv::new();
+        let new_treasury = Address::generate(&t.env);
+
+        // Update treasury (admin holds ROLE_ADMIN)
+        t.client().set_treasury(&t.admin, &new_treasury);
+
+        // Verify config reflects new treasury
+        let config = t.client().get_config();
+        assert_eq!(config.fee_recipient, new_treasury);
+    }
+
+    #[test]
+    #[should_panic(expected = "Missing role")]
+    fn test_set_treasury_non_admin_panics() {
+        let t = TestEnv::new();
+        let stranger = Address::generate(&t.env);
+        let new_treasury = Address::generate(&t.env);
+        t.client().set_treasury(&stranger, &new_treasury);
+    }
+
+    #[test]
+    fn test_tip_fee_goes_to_updated_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let worker = Address::generate(&env);
+        let old_treasury = Address::generate(&env);
+        let new_treasury = Address::generate(&env);
+
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_addr = token_id.address();
+        StellarAssetClient::new(&env, &token_addr).mint(&payer, &1_000_000);
+
+        let contract_id = env.register_contract(None, MarketContract);
+        MarketContractClient::new(&env, &contract_id).initialize(&admin, &200, &old_treasury);
+
+        let client = MarketContractClient::new(&env, &contract_id);
+        // Update treasury to new_treasury
+        client.set_treasury(&admin, &new_treasury);
+
+        client.tip(&payer, &worker, &token_addr, &100_000);
+
+        // fee = 100_000 * 200 / 10_000 = 2_000
+        let token = TokenClient::new(&env, &token_addr);
+        assert_eq!(token.balance(&new_treasury), 2_000);
+        assert_eq!(token.balance(&old_treasury), 0);
+        assert_eq!(token.balance(&worker), 98_000);
     }
 
     #[test]
@@ -1351,6 +1541,55 @@ mod tests {
          assert_eq!(t.token_balance(&t.payer), 1_000_000);
          assert!(t.client().get_multisig_escrow(&id).unwrap().cancelled);
      }
+
+    // -------------------------------------------------------------------------
+    // Migration tests (#535)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_initial_schema_version_is_1() {
+        let t = TestEnv::new();
+        assert_eq!(t.client().get_schema_version(), 1u32);
+    }
+
+    #[test]
+    fn test_migrate_v1_to_v2_bumps_version() {
+        let t = TestEnv::new();
+        t.client().migrate(&t.admin, &1u32);
+        assert_eq!(t.client().get_schema_version(), 2u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Wrong schema version")]
+    fn test_migrate_double_run_panics() {
+        let t = TestEnv::new();
+        t.client().migrate(&t.admin, &1u32);
+        t.client().migrate(&t.admin, &1u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Wrong schema version")]
+    fn test_migrate_wrong_version_panics() {
+        let t = TestEnv::new();
+        t.client().migrate(&t.admin, &2u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Missing role")]
+    fn test_migrate_non_admin_panics() {
+        let t = TestEnv::new();
+        let stranger = Address::generate(&t.env);
+        t.client().migrate(&stranger, &1u32);
+    }
+
+    #[test]
+    fn test_migrate_sequential_versions() {
+        let t = TestEnv::new();
+        t.client().migrate(&t.admin, &1u32);
+        assert_eq!(t.client().get_schema_version(), 2u32);
+        t.client().migrate(&t.admin, &2u32);
+        assert_eq!(t.client().get_schema_version(), 3u32);
+    }
  }
 
  // ---------------------------------------------------------------------------

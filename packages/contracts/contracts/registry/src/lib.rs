@@ -272,6 +272,8 @@ pub enum DataKey {
     Badge(Symbol, Symbol),
     /// Persistent storage — [`WorkerSubscription`] keyed by worker id.
     Subscription(Symbol),
+    /// Persistent storage — current storage schema version (u32), used by [`migrate`].
+    SchemaVersion,
 }
 
 // =============================================================================
@@ -303,6 +305,8 @@ impl RegistryContract {
         );
         // Store admin in persistent storage
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        // Set initial schema version
+        env.storage().persistent().set(&DataKey::SchemaVersion, &1u32);
         // Bootstrap: grant ROLE_ADMIN to the initial admin.
         let role = Symbol::new(&env, ROLE_ADMIN);
         let mut members: Vec<Address> = Vec::new(&env);
@@ -1576,10 +1580,14 @@ fn role_to_id(role: &Symbol) -> u64 {
             });
 
         let elapsed = now.saturating_sub(info.last_reward_ledger);
-        info.rewards_accumulated +=
-            info.amount * Self::REWARD_RATE_BPS_PER_1000_SECS * elapsed as i128 / 1000;
+        let new_rewards = info.amount
+            .checked_mul(Self::REWARD_RATE_BPS_PER_1000_SECS)
+            .and_then(|v| v.checked_mul(elapsed as i128))
+            .and_then(|v| v.checked_div(1000))
+            .expect("Reward overflow");
+        info.rewards_accumulated = info.rewards_accumulated.checked_add(new_rewards).expect("Reward overflow");
         info.last_reward_ledger = now;
-        info.amount += amount;
+        info.amount = info.amount.checked_add(amount).expect("Stake overflow");
         info.unstake_requested_at = 0;
         env.storage().persistent().set(&DataKey::StakeInfo(worker_id.clone()), &info);
 
@@ -1659,10 +1667,14 @@ fn role_to_id(role: &Symbol) -> u64 {
         );
 
         let elapsed = now.saturating_sub(info.last_reward_ledger);
-        info.rewards_accumulated +=
-            info.amount * Self::REWARD_RATE_BPS_PER_1000_SECS * elapsed as i128 / 1000;
+        let final_rewards = info.amount
+            .checked_mul(Self::REWARD_RATE_BPS_PER_1000_SECS)
+            .and_then(|v| v.checked_mul(elapsed as i128))
+            .and_then(|v| v.checked_div(1000))
+            .expect("Reward overflow");
+        info.rewards_accumulated = info.rewards_accumulated.checked_add(final_rewards).expect("Reward overflow");
 
-        let total_return = info.amount + info.rewards_accumulated;
+        let total_return = info.amount.checked_add(info.rewards_accumulated).expect("Return overflow");
         let client = token::Client::new(&env, &info.token);
         client.transfer(&env.current_contract_address(), &caller, &total_return);
 
@@ -1716,8 +1728,11 @@ fn role_to_id(role: &Symbol) -> u64 {
 
         metrics.jobs_completed = jobs_completed;
         if rating > 0 {
-            let total = metrics.avg_rating as u64 * metrics.total_ratings as u64 + rating as u64;
-            metrics.total_ratings += 1;
+            let total = (metrics.avg_rating as u64)
+                .checked_mul(metrics.total_ratings as u64)
+                .and_then(|v| v.checked_add(rating as u64))
+                .expect("Rating overflow");
+            metrics.total_ratings = metrics.total_ratings.checked_add(1).expect("overflow");
             metrics.avg_rating = (total / metrics.total_ratings as u64) as u32;
         }
         metrics.last_updated = env.ledger().timestamp();
@@ -1740,9 +1755,9 @@ fn role_to_id(role: &Symbol) -> u64 {
         }
         let rating_weight = 70u32;
         let completion_weight = 30u32;
-        let rating_score = (metrics.avg_rating * rating_weight) / 100;
-        let completion_score = metrics.jobs_completed.min(100) * completion_weight;
-        rating_score + completion_score
+        let rating_score = metrics.avg_rating.checked_mul(rating_weight).expect("overflow") / 100;
+        let completion_score = metrics.jobs_completed.min(100).checked_mul(completion_weight).expect("overflow");
+        rating_score.checked_add(completion_score).expect("overflow")
     }
 
     /// Get performance metrics for a worker.
@@ -1870,6 +1885,73 @@ fn role_to_id(role: &Symbol) -> u64 {
         env.storage()
             .persistent()
             .get(&DataKey::Badge(worker_id, badge_id))
+    }
+
+    // -------------------------------------------------------------------------
+    // Upgrade
+    // -------------------------------------------------------------------------
+
+    /// Upgrade the contract WASM in-place, preserving the contract ID and all storage.
+    ///
+    /// # Parameters
+    /// - `new_wasm_hash`: The hash returned by `stellar contract install` for the new WASM.
+    ///
+    // -------------------------------------------------------------------------
+    // Schema migration (#535)
+    // -------------------------------------------------------------------------
+
+    /// Return the current storage schema version.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32)
+    }
+
+    /// Run version-specific storage migration logic.
+    ///
+    /// Guards:
+    /// - Caller must hold `ROLE_ADMIN`.
+    /// - `expected_version` must equal the current schema version (prevents double-run
+    ///   and out-of-order migrations).
+    /// - After success the version is bumped to `expected_version + 1`.
+    ///
+    /// # Parameters
+    /// - `admin`: Must hold `ROLE_ADMIN`; `require_auth()` is enforced.
+    /// - `expected_version`: The version this migration upgrades *from*.
+    ///
+    /// # Panics
+    /// - `"Missing role"` if `admin` does not hold `ROLE_ADMIN`.
+    /// - `"Wrong schema version"` if current version ≠ `expected_version`.
+    ///
+    /// # Events
+    /// Emits `("Migrated",)` with data `(expected_version, expected_version + 1)`.
+    pub fn migrate(env: Env, admin: Address, expected_version: u32) {
+        Self::require_role(&env, &Symbol::new(&env, ROLE_ADMIN), &admin);
+
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32);
+
+        assert!(current == expected_version, "Wrong schema version");
+
+        // ---- version-specific migration logic --------------------------------
+        // Version 1 → 2: placeholder (add real field backfills here as needed)
+        if expected_version == 1 {
+            // Example: no structural change needed for v1→v2 in this release.
+            // Future migrations add logic here.
+        }
+        // ----------------------------------------------------------------------
+
+        let new_version = expected_version.checked_add(1).expect("Version overflow");
+        env.storage().persistent().set(&DataKey::SchemaVersion, &new_version);
+
+        env.events().publish(
+            (symbol_short!("Migrated"),),
+            (expected_version, new_version),
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2519,5 +2601,59 @@ mod tests {
             t.client().upgrade(&stranger, &dummy_hash);
         }));
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Migration tests (#535)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_initial_schema_version_is_1() {
+        let t = TestEnv::new();
+        assert_eq!(t.client().get_schema_version(), 1u32);
+    }
+
+    #[test]
+    fn test_migrate_v1_to_v2_bumps_version() {
+        let t = TestEnv::new();
+        assert_eq!(t.client().get_schema_version(), 1u32);
+        t.client().migrate(&t.admin, &1u32);
+        assert_eq!(t.client().get_schema_version(), 2u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Wrong schema version")]
+    fn test_migrate_double_run_panics() {
+        let t = TestEnv::new();
+        t.client().migrate(&t.admin, &1u32);
+        // Running again with the same expected_version should panic
+        t.client().migrate(&t.admin, &1u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Wrong schema version")]
+    fn test_migrate_wrong_version_panics() {
+        let t = TestEnv::new();
+        // Current version is 1, passing 2 should panic
+        t.client().migrate(&t.admin, &2u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Missing role")]
+    fn test_migrate_non_admin_panics() {
+        let t = TestEnv::new();
+        let stranger = Address::generate(&t.env);
+        t.client().migrate(&stranger, &1u32);
+    }
+
+    #[test]
+    fn test_migrate_sequential_versions() {
+        let t = TestEnv::new();
+        // v1 → v2
+        t.client().migrate(&t.admin, &1u32);
+        assert_eq!(t.client().get_schema_version(), 2u32);
+        // v2 → v3
+        t.client().migrate(&t.admin, &2u32);
+        assert_eq!(t.client().get_schema_version(), 3u32);
     }
 }
