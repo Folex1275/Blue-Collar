@@ -243,6 +243,8 @@ Base URL: `http://localhost:3000/api`
 > Content-Type: multipart/form-data
 > X-HTTP-Method: PUT
 > ```
+>
+> See [DOCUMENTATION.json](packages/api/DOCUMENTATION.json) for detailed explanation of the method-override pattern, including client implementation examples and common mistakes to avoid.
 
 ### Admin
 
