@@ -2,6 +2,8 @@
 
 > Find Skilled Workers Near You
 
+**[English](./README.md) | [Português](./README.pt.md)**
+
 [![CI](https://github.com/Fidelis900/Blue-Collar/actions/workflows/ci.yml/badge.svg)](https://github.com/Fidelis900/Blue-Collar/actions/workflows/ci.yml)
 [![API Tests](https://github.com/Fidelis900/Blue-Collar/actions/workflows/api-tests.yml/badge.svg)](https://github.com/Fidelis900/Blue-Collar/actions/workflows/api-tests.yml)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
