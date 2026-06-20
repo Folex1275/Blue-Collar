@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import * as Dialog from "@radix-ui/react-dialog";
@@ -623,7 +623,7 @@ function MetricCard({
   value,
   sub,
 }: {
-  icon: React.ReactNode;
+  icon: ReactNode;
   label: string;
   value: string | number;
   sub?: string;
