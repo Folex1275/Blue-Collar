@@ -19,6 +19,7 @@ import auditRoutes from './routes/audit.js'
 import responseTimeRoutes from './routes/response-time.js'
 import insuranceRoutes from './routes/insurance.js'
 import referralRoutes from './routes/referral.js'
+import analyticsRoutes from './routes/analytics.js'
 import paymentRoutes from './routes/payments.js'
 import vitalsRoutes from './routes/vitals.js'
 import { auditMiddleware } from './middleware/audit.js'
@@ -69,6 +70,7 @@ app.use('/api/audit', auditRoutes)
 app.use('/api', responseTimeRoutes)
 app.use('/api/workers', insuranceRoutes)
 app.use('/api/referrals', referralRoutes)
+app.use('/api/analytics', analyticsRoutes)
 app.use('/api/payments', paymentRoutes)
 app.use('/api', vitalsRoutes)
 // ── Versioned routes (v1) ─────────────────────────────────────────────────────
