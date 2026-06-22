@@ -1,0 +1,188 @@
+/**
+ * Request/Response schema transformation utilities for API versioning
+ */
+
+import type { Request, Response, NextFunction } from 'express'
+
+/**
+ * Define schema transformations between API versions
+ */
+interface SchemaTransformer {
+  v1ToV2?: (data: any) => any
+  v2ToV1?: (data: any) => any
+}
+
+/**
+ * Schema transformation mappings for different endpoints
+ */
+const transformers: Record<string, SchemaTransformer> = {
+  worker: {
+    v1ToV2: (worker: any) => ({
+      ...worker,
+      verificationStatus: worker.verificationStatus || 'unverified',
+    }),
+    v2ToV1: (worker: any) => {
+      const { verificationStatus, ...rest } = worker
+      return rest
+    },
+  },
+  user: {
+    v1ToV2: (user: any) => ({
+      ...user,
+      twoFactorEnabled: user.twoFactorEnabled ?? false,
+    }),
+    v2ToV1: (user: any) => {
+      const { twoFactorEnabled, ...rest } = user
+      return rest
+    },
+  },
+}
+
+/**
+ * Transform response data based on target API version
+ */
+export function transformResponseData(
+  data: any,
+  resourceType: string,
+  targetVersion: string,
+  sourceVersion: string = 'v1'
+): any {
+  if (!data) return data
+  if (targetVersion === sourceVersion) return data
+
+  const transformer = transformers[resourceType]
+  if (!transformer) return data
+
+  if (sourceVersion === 'v1' && targetVersion === 'v2') {
+    return Array.isArray(data)
+      ? data.map(item => transformer.v1ToV2?.(item) ?? item)
+      : transformer.v1ToV2?.(data) ?? data
+  }
+
+  if (sourceVersion === 'v2' && targetVersion === 'v1') {
+    return Array.isArray(data)
+      ? data.map(item => transformer.v2ToV1?.(item) ?? item)
+      : transformer.v2ToV1?.(data) ?? data
+  }
+
+  return data
+}
+
+/**
+ * Get compatible fields for a version
+ * Returns fields that should be included in responses for a given version
+ */
+export function getCompatibleFields(version: string, resourceType: string): string[] {
+  const fieldMapping: Record<string, Record<string, string[]>> = {
+    worker: {
+      v1: ['id', 'name', 'phone', 'email', 'bio', 'isActive', 'walletAddress', 'avgRating', 'reviewCount', 'categoryId', 'createdAt', 'updatedAt'],
+      v2: ['id', 'name', 'phone', 'email', 'bio', 'isActive', 'walletAddress', 'avgRating', 'reviewCount', 'categoryId', 'verificationStatus', 'createdAt', 'updatedAt'],
+    },
+    user: {
+      v1: ['id', 'email', 'firstName', 'lastName', 'role', 'verified'],
+      v2: ['id', 'email', 'firstName', 'lastName', 'role', 'verified', 'twoFactorEnabled'],
+    },
+  }
+
+  return fieldMapping[resourceType]?.[version] ?? []
+}
+
+/**
+ * Filter response to only include compatible fields
+ */
+export function filterCompatibleFields(data: any, version: string, resourceType: string): any {
+  const fields = getCompatibleFields(version, resourceType)
+  if (!fields.length) return data
+
+  if (Array.isArray(data)) {
+    return data.map(item => filterFields(item, fields))
+  }
+
+  return filterFields(data, fields)
+}
+
+function filterFields(obj: Record<string, any>, fields: string[]): Record<string, any> {
+  const result: Record<string, any> = {}
+  for (const field of fields) {
+    if (field in obj) {
+      result[field] = obj[field]
+    }
+  }
+  return result
+}
+
+/**
+ * Middleware to transform response based on Accept-Version header
+ */
+export function responseSchemaVersioning(req: Request, res: Response, next: NextFunction) {
+  const originalJson = res.json.bind(res)
+
+  res.json = function(data: any) {
+    const targetVersion = req.apiVersion || 'v1'
+
+    // If response has a data field, transform it
+    if (data && typeof data === 'object' && 'data' in data) {
+      const resourceType = inferResourceType(req.path)
+      if (resourceType) {
+        data.data = transformResponseData(data.data, resourceType, targetVersion, 'v1')
+      }
+    }
+
+    return originalJson.call(this, data)
+  }
+
+  next()
+}
+
+/**
+ * Infer resource type from request path
+ */
+function inferResourceType(path: string): string | null {
+  if (path.includes('/workers')) return 'worker'
+  if (path.includes('/users')) return 'user'
+  if (path.includes('/auth')) return 'user'
+  return null
+}
+
+/**
+ * Validate request payload compatibility with API version
+ */
+export function validateRequestSchema(
+  data: any,
+  version: string,
+  resourceType: string
+): { valid: boolean; errors?: string[] } {
+  const compatibleFields = getCompatibleFields(version, resourceType)
+  if (!compatibleFields.length) {
+    return { valid: true }
+  }
+
+  const dataFields = Object.keys(data || {})
+  const invalidFields = dataFields.filter(field => !compatibleFields.includes(field))
+
+  if (invalidFields.length > 0) {
+    return {
+      valid: false,
+      errors: [
+        `Invalid fields for ${resourceType} in ${version}: ${invalidFields.join(', ')}`,
+      ],
+    }
+  }
+
+  return { valid: true }
+}
+
+/**
+ * Get schema differences between versions
+ */
+export function getSchemaDifferences(
+  resourceType: string,
+  v1Fields: string[],
+  v2Fields: string[]
+): Record<string, any> {
+  return {
+    added: v2Fields.filter(f => !v1Fields.includes(f)),
+    removed: v1Fields.filter(f => !v2Fields.includes(f)),
+    unchanged: v1Fields.filter(f => v2Fields.includes(f)),
+  }
+}

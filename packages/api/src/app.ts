@@ -25,6 +25,7 @@ import vitalsRoutes from './routes/vitals.js'
 import { auditMiddleware } from './middleware/audit.js'
 import { sanitize } from './middleware/sanitize.js'
 import { versionMiddleware, deprecationWarning, versionDeprecationMiddleware } from './middleware/version.js'
+import { responseSchemaVersioning } from './utils/schemaVersioning.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import docsRouter from './openapi/docs.js'
 import { metricsEndpoint, metricsMiddleware } from './middleware/metrics.js'
@@ -55,6 +56,7 @@ app.use(methodOverride('X-HTTP-Method'))
 app.use(passport.initialize())
 app.use(versionMiddleware)
 app.use(versionDeprecationMiddleware)
+app.use(responseSchemaVersioning)
 app.use(auditMiddleware)
 
 app.use('/api/auth', authRoutes)
